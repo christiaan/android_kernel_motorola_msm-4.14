@@ -1682,6 +1682,8 @@ ffs_fs_mount(struct file_system_type *t, int flags,
 		return ERR_PTR(ret);
 
 	ffs = ffs_data_new(dev_name);
+	if (IS_ERR(ffs))
+		return ERR_CAST(ffs);
 	if (unlikely(!ffs))
 		return ERR_PTR(-ENOMEM);
 	ffs->file_perms = data.perms;
