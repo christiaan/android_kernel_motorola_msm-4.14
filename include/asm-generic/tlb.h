@@ -455,6 +455,13 @@ static inline void tlb_change_page_size(struct mmu_gather *tlb,
 #endif
 }
 
+static inline void tlb_flush_pmd_range(struct mmu_gather *tlb,
+				     unsigned long address, unsigned long size)
+{
+	__tlb_adjust_range(tlb, address, size);
+	tlb->cleared_pmds = 1;
+}
+
 static inline unsigned long tlb_get_unmap_shift(struct mmu_gather *tlb)
 {
 	if (tlb->cleared_ptes)
