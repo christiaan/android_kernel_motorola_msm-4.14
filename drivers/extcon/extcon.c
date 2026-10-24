@@ -1315,10 +1315,19 @@ int extcon_dev_register(struct extcon_dev *edev)
 			ret = -ENOMEM;
 			goto err_alloc_nh;
 		}
+
+		edev->bnh = kcalloc(edev->max_supported, sizeof(*edev->bnh),
+				GFP_KERNEL);
+		if (!edev->bnh) {
+			ret = -ENOMEM;
+			goto err_alloc_bnh;
+		}
 	}
 
-	for (index = 0; index < edev->max_supported; index++)
+	for (index = 0; index < edev->max_supported; index++) {
 		RAW_INIT_NOTIFIER_HEAD(&edev->nh[index]);
+		BLOCKING_INIT_NOTIFIER_HEAD(&edev->bnh[index]);
+	}
 
 	RAW_INIT_NOTIFIER_HEAD(&edev->nh_all);
 
@@ -1331,13 +1340,6 @@ int extcon_dev_register(struct extcon_dev *edev)
 		goto err_dev;
 	}
 
-	edev->bnh = devm_kzalloc(&edev->dev,
-			sizeof(*edev->bnh) * edev->max_supported, GFP_KERNEL);
-	if (!edev->bnh) {
-		ret = -ENOMEM;
-		goto err_dev;
-	}
-
 	mutex_lock(&extcon_dev_list_lock);
 	list_add(&edev->entry, &extcon_dev_list);
 	mutex_unlock(&extcon_dev_list_lock);
@@ -1345,6 +1347,9 @@ int extcon_dev_register(struct extcon_dev *edev)
 	return 0;
 
 err_dev:
+	if (edev->max_supported)
+		kfree(edev->bnh);
+err_alloc_bnh:
 	if (edev->max_supported)
 		kfree(edev->nh);
 err_alloc_nh:
@@ -1409,6 +1414,7 @@ void extcon_dev_unregister(struct extcon_dev *edev)
 		kfree(edev->extcon_dev_type.groups);
 		kfree(edev->cables);
 		kfree(edev->nh);
+		kfree(edev->bnh);
 	}
 
 	put_device(&edev->dev);
