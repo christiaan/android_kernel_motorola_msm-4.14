@@ -2122,6 +2122,9 @@ void sdhci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	    host->timing == ios->timing &&
 	    host->version >= SDHCI_SPEC_300 &&
 	    !sdhci_presetable_values_change(host, ios)) {
+		if (host->mmc && host->mmc->card &&
+				mmc_card_sdio(host->mmc->card))
+			sdhci_cfg_irq(host, true, false);
 		spin_unlock_irqrestore(&host->lock, flags);
 		return;
 	}
