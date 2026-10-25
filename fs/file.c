@@ -676,7 +676,7 @@ int __close_fd(struct files_struct *files, unsigned fd)
 
 /**
  * last_fd - return last valid index into fd table
- * @cur_fds: files struct
+ * @fdt: fd table
  *
  * Context: Either rcu read lock or files_lock must be held.
  *
@@ -718,6 +718,9 @@ static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
 		/* beyond the last fd in that table */
 		if (PTR_ERR(file) == -EINVAL)
 			return;
+
+		/* a large, mostly empty table must not hog the CPU */
+		cond_resched();
 	}
 }
 

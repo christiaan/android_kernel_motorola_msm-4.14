@@ -1206,11 +1206,17 @@ EXPORT_SYMBOL(sys_close);
  *
  * @fd:     starting file descriptor to close
  * @max_fd: last file descriptor to close
- * @flags:  reserved for future extensions
+ * @flags:  CLOSE_RANGE_UNSHARE and/or CLOSE_RANGE_CLOEXEC
  *
  * This closes a range of file descriptors. All file descriptors
  * from @fd up to and including @max_fd are closed.
  * Currently, errors to close a given file descriptor are ignored.
+ *
+ * CLOSE_RANGE_UNSHARE in a process that has mmapped binder always gets
+ * a new table, because binder holds a reference to the old one, and
+ * binder keeps installing received fds into the old table. This is the
+ * same as unshare(CLONE_FILES) on this kernel; no Android userspace
+ * uses CLOSE_RANGE_UNSHARE.
  */
 SYSCALL_DEFINE3(close_range, unsigned int, fd, unsigned int, max_fd,
 		unsigned int, flags)
