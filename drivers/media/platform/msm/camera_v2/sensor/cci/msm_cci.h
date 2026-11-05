@@ -20,6 +20,7 @@
 #include <linux/workqueue.h>
 #include <media/msm_cam_sensor.h>
 #include <soc/qcom/camera2.h>
+#include <linux/wait.h>
 #include "msm_sd.h"
 #include "cam_soc_api.h"
 
@@ -126,6 +127,10 @@ struct msm_camera_cci_master_info {
 	struct completion report_q[NUM_QUEUES];
 	atomic_t done_pending[NUM_QUEUES];
 	spinlock_t lock_q[NUM_QUEUES];
+	/* Transfers in flight on this master, see msm_cci_freq_get() */
+	struct mutex freq_lock;
+	int freq_users;
+	wait_queue_head_t freq_wq;
 };
 
 struct msm_cci_clk_params_t {

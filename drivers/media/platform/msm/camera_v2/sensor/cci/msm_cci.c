@@ -162,6 +162,49 @@ static int32_t msm_cci_set_clk_param(struct cci_device *cci_dev,
 	return 0;
 }
 
+/*
+ * The SCL timing registers belong to the whole master, but each client
+ * picks its own i2c_freq_mode and the two queues of a master run at the
+ * same time. On doha the main sensor (FAST) and its actuator (FAST_PLUS)
+ * share master 0, and msm_cci_set_clk_param() used to retime the bus in
+ * the middle of the other queue's transfer, which wedges the master: both
+ * queues time out and only powering the sensor down frees it. A transfer
+ * that needs a different mode now waits until the master is idle.
+ */
+static int32_t msm_cci_freq_get(struct cci_device *cci_dev,
+	struct msm_camera_cci_ctrl *c_ctrl)
+{
+	enum cci_i2c_master_t master = c_ctrl->cci_info->cci_i2c_master;
+	struct msm_camera_cci_master_info *mi =
+		&cci_dev->cci_master_info[master];
+	int32_t rc;
+
+	mutex_lock(&mi->freq_lock);
+	while (mi->freq_users && cci_dev->i2c_freq_mode[master] !=
+			c_ctrl->cci_info->i2c_freq_mode) {
+		mutex_unlock(&mi->freq_lock);
+		wait_event(mi->freq_wq, READ_ONCE(mi->freq_users) == 0);
+		mutex_lock(&mi->freq_lock);
+	}
+	rc = msm_cci_set_clk_param(cci_dev, c_ctrl);
+	if (rc == 0)
+		mi->freq_users++;
+	mutex_unlock(&mi->freq_lock);
+	return rc;
+}
+
+static void msm_cci_freq_put(struct cci_device *cci_dev,
+	enum cci_i2c_master_t master)
+{
+	struct msm_camera_cci_master_info *mi =
+		&cci_dev->cci_master_info[master];
+
+	mutex_lock(&mi->freq_lock);
+	if (--mi->freq_users == 0)
+		wake_up_all(&mi->freq_wq);
+	mutex_unlock(&mi->freq_lock);
+}
+
 static int32_t msm_cci_flush_queue(struct cci_device *cci_dev,
 	enum cci_i2c_master_t master)
 {
@@ -846,10 +889,11 @@ static int32_t msm_cci_i2c_read(struct v4l2_subdev *sd,
 	mutex_lock(&cci_dev->cci_master_info[master].mutex_q[queue]);
 
 	/* Set the I2C Frequency */
-	rc = msm_cci_set_clk_param(cci_dev, c_ctrl);
+	rc = msm_cci_freq_get(cci_dev, c_ctrl);
 	if (rc < 0) {
 		pr_err("%s:%d msm_cci_set_clk_param failed rc = %d\n",
 			__func__, __LINE__, rc);
+		mutex_unlock(&cci_dev->cci_master_info[master].mutex_q[queue]);
 		return rc;
 	}
 
@@ -990,6 +1034,7 @@ static int32_t msm_cci_i2c_read(struct v4l2_subdev *sd,
 		}
 	} while (--read_words > 0);
 ERROR:
+	msm_cci_freq_put(cci_dev, master);
 	mutex_unlock(&cci_dev->cci_master_info[master].mutex_q[queue]);
 	return rc;
 }
@@ -1080,7 +1125,7 @@ static int32_t msm_cci_i2c_write(struct v4l2_subdev *sd,
 		c_ctrl->cci_info->id_map);
 
 	/* Set the I2C Frequency */
-	rc = msm_cci_set_clk_param(cci_dev, c_ctrl);
+	rc = msm_cci_freq_get(cci_dev, c_ctrl);
 	if (rc < 0) {
 		pr_err("%s:%d msm_cci_set_clk_param failed rc = %d\n",
 			__func__, __LINE__, rc);
@@ -1111,6 +1156,7 @@ static int32_t msm_cci_i2c_write(struct v4l2_subdev *sd,
 	}
 
 ERROR:
+	msm_cci_freq_put(cci_dev, master);
 	return rc;
 }
 
@@ -1899,6 +1945,8 @@ static void msm_cci_init_cci_params(struct cci_device *new_cci_dev)
 	for (i = 0; i < NUM_MASTERS; i++) {
 		new_cci_dev->cci_master_info[i].status = 0;
 		mutex_init(&new_cci_dev->cci_master_info[i].mutex);
+		mutex_init(&new_cci_dev->cci_master_info[i].freq_lock);
+		init_waitqueue_head(&new_cci_dev->cci_master_info[i].freq_wq);
 		init_completion(
 			&new_cci_dev->cci_master_info[i].reset_complete);
 
