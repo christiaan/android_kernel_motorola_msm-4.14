@@ -195,6 +195,15 @@ struct fts_ts_data {
     spinlock_t irq_lock;
     struct mutex report_mutex;
     struct mutex bus_lock;
+#ifdef CONFIG_PM_SLEEP
+    /*
+     * System suspend guard, see fts_irq_handler(): set from the driver's
+     * system-suspend callback until its resume, under pm_lock.
+     */
+    struct mutex pm_lock;
+    bool pm_suspend;
+    bool pm_irq_pending;
+#endif
     int irq;
     int log_level;
     int fw_is_running;      /* confirm fw is running when using spi:default 0 */

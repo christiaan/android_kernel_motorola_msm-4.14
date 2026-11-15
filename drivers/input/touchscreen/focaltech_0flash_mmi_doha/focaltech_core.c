@@ -37,6 +37,7 @@
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
 #include <linux/of_irq.h>
+#include <linux/suspend.h>
 
 #ifdef FOCALTECH_PEN_NOTIFIER
 #include <linux/pen_detection_notify.h>
@@ -887,7 +888,33 @@ static void fts_irq_read_report(void)
 
 static irqreturn_t fts_irq_handler(int irq, void *data)
 {
+#ifdef CONFIG_PM_SLEEP
+    struct fts_ts_data *ts_data = data;
+
+    /*
+     * In gesture mode (double tap to wake) the touch IRQ stays enabled as
+     * a wake source while the system suspends. Reading the touch data
+     * then starts an SPI transfer on a controller that is suspending or
+     * already suspended: spi-geni re-enables runtime PM behind the PM
+     * core's back, the suspend fails and the SoC can hang until the
+     * watchdog resets it (doha #76). So while the system is suspended,
+     * leave the bus alone: note the interrupt, abort the suspend as a
+     * wake IRQ would, and read the data in fts_pm_resume(). pm_lock is
+     * held across the read so fts_pm_suspend() can't return while a
+     * transfer is in flight.
+     */
+    mutex_lock(&ts_data->pm_lock);
+    if (ts_data->pm_suspend) {
+        ts_data->pm_irq_pending = true;
+        mutex_unlock(&ts_data->pm_lock);
+        pm_system_wakeup();
+        return IRQ_HANDLED;
+    }
     fts_irq_read_report();
+    mutex_unlock(&ts_data->pm_lock);
+#else
+    fts_irq_read_report();
+#endif
     return IRQ_HANDLED;
 }
 
@@ -1823,6 +1850,9 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
     mutex_init(&ts_data->report_mutex);
     mutex_init(&ts_data->bus_lock);
     mutex_init(&ts_data->suspend_resume_mutex);
+#ifdef CONFIG_PM_SLEEP
+    mutex_init(&ts_data->pm_lock);
+#endif
 #ifdef FOCALTECH_SENSOR_EN
     mutex_init(&ts_data->state_mutex);
     //unknown screen state
@@ -2319,6 +2349,45 @@ static int fts_ts_resume(struct device *dev)
     return ret;
 }
 
+#ifdef CONFIG_PM_SLEEP
+/*
+ * System sleep callbacks. Screen off/on is handled by the display notifier
+ * (fts_ts_suspend/fts_ts_resume); these only keep the IRQ thread off the
+ * SPI bus while the system itself is suspended. They run before the SPI
+ * controller suspends and after it resumes.
+ */
+static int fts_pm_suspend(struct device *dev)
+{
+    struct fts_ts_data *ts_data = dev_get_drvdata(dev);
+
+    mutex_lock(&ts_data->pm_lock);
+    ts_data->pm_suspend = true;
+    mutex_unlock(&ts_data->pm_lock);
+
+    return 0;
+}
+
+static int fts_pm_resume(struct device *dev)
+{
+    struct fts_ts_data *ts_data = dev_get_drvdata(dev);
+
+    mutex_lock(&ts_data->pm_lock);
+    ts_data->pm_suspend = false;
+    if (ts_data->pm_irq_pending) {
+        ts_data->pm_irq_pending = false;
+        FTS_DEBUG("read touch irq deferred by system suspend");
+        fts_irq_read_report();
+    }
+    mutex_unlock(&ts_data->pm_lock);
+
+    return 0;
+}
+
+static const struct dev_pm_ops fts_dev_pm_ops = {
+    SET_SYSTEM_SLEEP_PM_OPS(fts_pm_suspend, fts_pm_resume)
+};
+#endif
+
 /*****************************************************************************
 * TP Driver
 *****************************************************************************/
@@ -2386,6 +2455,9 @@ static struct spi_driver fts_ts_driver = {
         .name = FTS_DRIVER_NAME,
         .owner = THIS_MODULE,
         .of_match_table = of_match_ptr(fts_dt_match),
+#ifdef CONFIG_PM_SLEEP
+        .pm = &fts_dev_pm_ops,
+#endif
     },
     .id_table = fts_ts_id,
 };

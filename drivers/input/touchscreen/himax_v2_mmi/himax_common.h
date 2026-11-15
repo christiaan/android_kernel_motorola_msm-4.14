@@ -361,9 +361,23 @@ struct himax_report_data {
 	uint8_t rawdata_frame_size;
 };
 
+/*
+ * System suspend guard for the IRQ thread (doha #76), see himax_ts_thread().
+ * Without FB/DRM the driver's own dev_pm_ops already do the full suspend.
+ */
+#if defined(CONFIG_PM_SLEEP) && (defined(CONFIG_FB) || defined(CONFIG_DRM))
+#define HX_PM_SLEEP_GUARD
+#endif
+
 struct himax_ts_data {
 	bool initialized;
 	bool suspended;
+#ifdef HX_PM_SLEEP_GUARD
+	/* set from the system-suspend callback until resume, under pm_lock */
+	struct mutex pm_lock;
+	bool pm_suspend;
+	bool pm_irq_pending;
+#endif
 	atomic_t resume_update_fail;
 	atomic_t resume_thread_is_runing;
 	atomic_t suspend_mode;

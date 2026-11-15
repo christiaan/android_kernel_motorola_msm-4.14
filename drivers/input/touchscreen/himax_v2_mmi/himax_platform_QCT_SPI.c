@@ -15,6 +15,7 @@
 
 #include "himax_platform.h"
 #include "himax_common.h"
+#include <linux/suspend.h>
 
 int i2c_error_count;
 int irq_enable_count;
@@ -754,7 +755,33 @@ static void himax_ts_isr_func(struct himax_ts_data *ts)
 
 irqreturn_t himax_ts_thread(int irq, void *ptr)
 {
+#ifdef HX_PM_SLEEP_GUARD
+	struct himax_ts_data *ts = ptr;
+
+	/*
+	 * The touch IRQ is a wake source, so it can fire while the system
+	 * suspends. Reading the event stack then starts an SPI transfer on a
+	 * controller that is suspending or already suspended: spi-geni
+	 * re-enables runtime PM behind the PM core's back, the suspend fails
+	 * and the SoC can hang until the watchdog resets it (doha #76, seen
+	 * with the FocalTech driver). So while the system is suspended,
+	 * leave the bus alone: note the interrupt, abort the suspend as a
+	 * wake IRQ would, and read the event in himax_pm_resume(). pm_lock
+	 * is held across the read so himax_pm_suspend() can't return while
+	 * a transfer is in flight.
+	 */
+	mutex_lock(&ts->pm_lock);
+	if (ts->pm_suspend) {
+		ts->pm_irq_pending = true;
+		mutex_unlock(&ts->pm_lock);
+		pm_system_wakeup();
+		return IRQ_HANDLED;
+	}
+	himax_ts_isr_func(ts);
+	mutex_unlock(&ts->pm_lock);
+#else
 	himax_ts_isr_func((struct himax_ts_data *)ptr);
+#endif
 
 	return IRQ_HANDLED;
 }
@@ -1032,6 +1059,9 @@ int himax_chip_common_probe(struct spi_device *spi)
 
 	ts->spi = spi;
 	mutex_init(&(ts->spi_lock));
+#ifdef HX_PM_SLEEP_GUARD
+	mutex_init(&ts->pm_lock);
+#endif
 	ts->dev = &spi->dev;
 	dev_set_drvdata(&spi->dev, ts);
 	spi_set_drvdata(spi, ts);
@@ -1076,6 +1106,45 @@ static const struct dev_pm_ops himax_common_pm_ops = {
 };
 #endif
 
+#ifdef HX_PM_SLEEP_GUARD
+/*
+ * System sleep callbacks. Screen off/on is handled by the display notifier;
+ * these only keep the IRQ thread off the SPI bus while the system itself is
+ * suspended. They run before the SPI controller suspends and after it
+ * resumes.
+ */
+static int himax_pm_suspend(struct device *dev)
+{
+	struct himax_ts_data *ts = dev_get_drvdata(dev);
+
+	mutex_lock(&ts->pm_lock);
+	ts->pm_suspend = true;
+	mutex_unlock(&ts->pm_lock);
+
+	return 0;
+}
+
+static int himax_pm_resume(struct device *dev)
+{
+	struct himax_ts_data *ts = dev_get_drvdata(dev);
+
+	mutex_lock(&ts->pm_lock);
+	ts->pm_suspend = false;
+	if (ts->pm_irq_pending) {
+		ts->pm_irq_pending = false;
+		I("%s: read touch irq deferred by system suspend\n", __func__);
+		himax_ts_isr_func(ts);
+	}
+	mutex_unlock(&ts->pm_lock);
+
+	return 0;
+}
+
+static const struct dev_pm_ops himax_pm_sleep_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(himax_pm_suspend, himax_pm_resume)
+};
+#endif
+
 #ifdef CONFIG_OF
 static const struct of_device_id himax_match_table[] = {
 	{.compatible = "himax,hxcommon" },
@@ -1090,6 +1159,9 @@ static struct spi_driver himax_common_driver = {
 		.name =		HIMAX_common_NAME,
 		.owner =	THIS_MODULE,
 		.of_match_table = himax_match_table,
+#ifdef HX_PM_SLEEP_GUARD
+		.pm = &himax_pm_sleep_ops,
+#endif
 	},
 	.probe =	himax_chip_common_probe,
 	.remove =	himax_chip_common_remove,
