@@ -622,6 +622,9 @@ static int fts_read_touchdata(struct fts_ts_data *data)
         FTS_INFO("succuss to get gesture data in irq handler");
         return 1;
     }
+    /* FT8719 sends plain touch frames in gesture mode (doha #89) */
+    if (fts_gesture_touch_frame(data, buf) == 0)
+        return 1;
 #endif
 
 

@@ -468,7 +468,7 @@ static unsigned int calc_feather(int coord, int prev_coord)
 
 static void new_touch(int x, int y)
 {
-	tap_time_pre = ktime_to_ms(ktime_get());
+	tap_time_pre = ktime_to_ms(ktime_get_boottime());
 	x_pre = x;
 	y_pre = y;
 	touch_nr++;
@@ -481,7 +481,7 @@ static bool detect_doubletap2wake(int x, int y)
 	} else if (touch_nr == 1) {
 		if ((calc_feather(x, x_pre) < DT2W_FEATHER) &&
 			(calc_feather(y, y_pre) < DT2W_FEATHER) &&
-			((ktime_to_ms(ktime_get())-tap_time_pre) < DT2W_TIME))
+			((ktime_to_ms(ktime_get_boottime())-tap_time_pre) < DT2W_TIME))
 			touch_nr++;
 		else {
 			doubletap2wake_reset();
@@ -496,6 +496,97 @@ static bool detect_doubletap2wake(int x, int y)
 		return true;
 	}
 	return false;
+}
+
+/*
+ * The doha FT8719 firmware doesn't recognise gestures. With gesture mode
+ * set up (D0 = 1) it keeps scanning and sends ordinary touch frames, and
+ * the gesture area of the frame stays empty, so fts_gesture_readdata()
+ * never sees a double click (doha #89). Find the double tap in those
+ * frames instead: a tap is a single finger that lifts within
+ * DT2W_TAP_MS and moves less than DT2W_FEATHER, and two taps close
+ * together in time and place (detect_doubletap2wake()) are reported like
+ * the firmware gesture would be.
+ */
+#define DT2W_TAP_MS	300
+
+static bool dt2w_down;
+static bool dt2w_moved;
+static unsigned long long dt2w_down_time;
+static int dt2w_down_x, dt2w_down_y;
+
+/*
+ * Called for each touch frame while the panel is in gesture mode, with
+ * buf laid out as in fts_read_touchdata(). Returns 0 if the frame was
+ * used here, 1 if the panel isn't in gesture mode.
+ */
+int fts_gesture_touch_frame(struct fts_ts_data *ts_data, u8 *buf)
+{
+	u8 points = buf[FTS_TOUCH_POINT_NUM] & 0x0F;
+	int flag = buf[FTS_TOUCH_EVENT_POS] >> 6;
+	int x = ((buf[FTS_TOUCH_X_H_POS] & 0x0F) << 8) + buf[FTS_TOUCH_X_L_POS];
+	int y = ((buf[FTS_TOUCH_Y_H_POS] & 0x0F) << 8) + buf[FTS_TOUCH_Y_L_POS];
+	unsigned long long now = ktime_to_ms(ktime_get_boottime());
+	bool tap;
+
+	if (!ts_data->suspended || fts_gesture_data.active != ENABLE)
+		return 1;
+
+	/*
+	 * Each touch can start a double tap: keep the system from
+	 * suspending again before the second tap could arrive.
+	 */
+#ifdef FOCALTECH_SENSOR_EN
+#ifdef CONFIG_HAS_WAKELOCK
+	wake_lock_timeout(&gesture_wakelock, msecs_to_jiffies(DT2W_TIME));
+#else
+	__pm_wakeup_event(&gesture_wakelock, DT2W_TIME);
+#endif
+#endif
+
+	if (points > 1) {
+		/* more than one finger (or no valid data): not a tap */
+		dt2w_down = false;
+		doubletap2wake_reset();
+		return 0;
+	}
+
+	if (EVENT_DOWN(flag)) {
+		if (!dt2w_down) {
+			dt2w_down = true;
+			dt2w_moved = false;
+			dt2w_down_time = now;
+			dt2w_down_x = x;
+			dt2w_down_y = y;
+		} else if (calc_feather(x, dt2w_down_x) >= DT2W_FEATHER ||
+			   calc_feather(y, dt2w_down_y) >= DT2W_FEATHER) {
+			dt2w_moved = true;
+		}
+		return 0;
+	}
+
+	if (flag != FTS_TOUCH_UP)
+		return 0;
+
+	/*
+	 * A lift without a down: the touch woke the system from suspend
+	 * and its earlier frames were dropped while it resumed (only the
+	 * latest frame is read then, see fts_pm_resume()). Count it by
+	 * the lift alone.
+	 */
+	tap = !dt2w_down ||
+	      (!dt2w_moved && now - dt2w_down_time <= DT2W_TAP_MS);
+	dt2w_down = false;
+	if (!tap) {
+		doubletap2wake_reset();
+		return 0;
+	}
+
+	if (detect_doubletap2wake(x, y)) {
+		FTS_INFO("double tap at (%d, %d)", x, y);
+		fts_gesture_report(ts_data->input_dev, GESTURE_DOUBLECLICK);
+	}
+	return 0;
 }
 #endif /* FOCALTECH_DT2W_ENABLE */
 
@@ -586,6 +677,11 @@ int fts_gesture_suspend(struct fts_ts_data *ts_data)
     u8 state = 0xFF;
 
     FTS_INFO("gesture suspend...");
+#if FOCALTECH_DT2W_ENABLE
+    /* don't pair a tap with one from before the screen went off */
+    dt2w_down = false;
+    doubletap2wake_reset();
+#endif
     /* gesture not enable, return immediately */
     if (fts_gesture_data.mode == DISABLE) {
         FTS_DEBUG("gesture is disabled");
