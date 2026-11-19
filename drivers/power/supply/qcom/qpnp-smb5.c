@@ -1741,6 +1741,17 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE:
 		val->intval = chg->fcc_stepper_enable;
 		break;
+	case POWER_SUPPLY_PROP_ONLINE:
+		/*
+		 * This psy is "qcom_battery" of type MAIN, so the power supply
+		 * core treats it as a charger: power_supply_changed_work() ->
+		 * power_supply_update_leds() asks it for ONLINE on every
+		 * change. Answer with battery presence instead of failing and
+		 * logging an error. ONLINE stays out of smb5_batt_props[], so
+		 * sysfs and uevents don't change.
+		 */
+		rc = smblib_get_prop_batt_present(chg, val);
+		break;
 	default:
 		pr_err("batt power supply prop %d not supported\n", psp);
 		return -EINVAL;
