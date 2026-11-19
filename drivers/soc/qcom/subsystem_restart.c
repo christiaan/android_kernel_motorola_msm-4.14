@@ -39,6 +39,8 @@
 #include <linux/of_irq.h>
 #include <linux/of.h>
 #include <asm/current.h>
+#include <linux/pid_namespace.h>
+#include <linux/sched/debug.h>
 #include <linux/timer.h>
 
 #include "peripheral-loader.h"
@@ -72,10 +74,77 @@ static unsigned long timeout_vals[NUM_SSR_COMMS] = {
 	[HLOS_TO_SUBSYS_SYSMON_SHUTDOWN] = SYSMON_COMM_TIMEOUT,
 };
 
+/*
+ * doha #83: when an SSR notifier times out, print the stack of the task
+ * that is running the notifier chain, plus all blocked (D state) tasks,
+ * before the panic. The panic itself stays, so the dump ends up in the
+ * last kmsg (pstore) that a bugreport after the reboot includes.
+ */
+#define SSR_TIMEOUT_SLOTS 8
+static struct {
+	struct subsys_notif_timeout *td;
+	pid_t pid;
+} ssr_timeout_owner[SSR_TIMEOUT_SLOTS];
+static DEFINE_SPINLOCK(ssr_timeout_owner_lock);
+
+static void ssr_timeout_note_owner(struct subsys_notif_timeout *td)
+{
+	unsigned long flags;
+	int i, slot = -1;
+
+	spin_lock_irqsave(&ssr_timeout_owner_lock, flags);
+	for (i = 0; i < SSR_TIMEOUT_SLOTS; i++) {
+		if (ssr_timeout_owner[i].td == td) {
+			slot = i;
+			break;
+		}
+		if (!ssr_timeout_owner[i].td && slot < 0)
+			slot = i;
+	}
+	if (slot >= 0) {
+		ssr_timeout_owner[slot].td = td;
+		ssr_timeout_owner[slot].pid = task_pid_nr(current);
+	}
+	spin_unlock_irqrestore(&ssr_timeout_owner_lock, flags);
+}
+
+static void ssr_timeout_dump(struct subsys_notif_timeout *td)
+{
+	struct task_struct *t;
+	pid_t pid = 0;
+	int i;
+
+	/*
+	 * The task dumps print below the console loglevel (4), and only
+	 * console output reaches pstore: raise it, as panic() does anyway.
+	 */
+	console_verbose();
+	for (i = 0; i < SSR_TIMEOUT_SLOTS; i++)
+		if (ssr_timeout_owner[i].td == td)
+			pid = ssr_timeout_owner[i].pid;
+	pr_err("ssr-timeout: comm=%d src=%s dest=%s, notifier task pid %d\n",
+	       td->comm_type, td->source_name ? td->source_name : "-",
+	       td->dest_name ? td->dest_name : "-", pid);
+	rcu_read_lock();
+	t = pid ? find_task_by_pid_ns(pid, &init_pid_ns) : NULL;
+	if (t)
+		sched_show_task(t);
+	rcu_read_unlock();
+	pr_err("ssr-timeout: blocked (D) tasks:\n");
+	show_state_filter(TASK_UNINTERRUPTIBLE);
+	pr_err("ssr-timeout: end of dump\n");
+}
+
 #ifdef CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT
-#define SSR_NOTIF_TIMEOUT_WARN(fmt...) panic(fmt)
+#define SSR_NOTIF_TIMEOUT_WARN(fmt...) do {	\
+		ssr_timeout_dump(timeout_data);		\
+		panic(fmt);				\
+	} while (0)
 #else /* CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT */
-#define SSR_NOTIF_TIMEOUT_WARN(fmt...) WARN(1, fmt)
+#define SSR_NOTIF_TIMEOUT_WARN(fmt...) do {	\
+		ssr_timeout_dump(timeout_data);		\
+		WARN(1, fmt);				\
+	} while (0)
 #endif /* CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT */
 
 #else /* CONFIG_SETUP_SSR_NOTIF_TIMEOUTS */
@@ -576,6 +645,7 @@ static void _setup_timeout(struct subsys_desc *source_ss,
 
 	timeout_data->timer.data = (unsigned long) timeout_data;
 	timeout_data->comm_type = comm_type;
+	ssr_timeout_note_owner(timeout_data);
 	timeout = jiffies + msecs_to_jiffies(timeout_vals[comm_type]);
 	mod_timer(&timeout_data->timer, timeout);
 }

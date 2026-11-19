@@ -1928,6 +1928,40 @@ wlan_hdd_pld_uevent(struct device *dev, struct pld_uevent_data *event_data)
 		if (qdf_in_interrupt() || bus_type == PLD_BUS_TYPE_PCIE)
 			break;
 
+		/*
+		 * doha #83: on SNOC (icnss) FW_DOWN comes from the early
+		 * crash IRQ thread, which is shared with the modem's
+		 * err-fatal smp2p bit, and from icnss's modem SSR notifier.
+		 * The cleanup suspends the WDI pipes with QMI force-clear
+		 * requests to the modem that can time out for seconds. Done
+		 * here, that holds up the modem SSR and runs the IPA
+		 * teardown inside the modem notifier chain. Leave it to
+		 * PLD_FW_CRASHED, which icnss sends from its event worker
+		 * after clearing FW_READY, as Motorola's stock driver does
+		 * (it shuts the IPA pipes down on PLD_RECOVERY, the same
+		 * icnss event). __hdd_soc_recovery_shutdown() still does it
+		 * if FW_CRASHED never came.
+		 */
+		if (bus_type == PLD_BUS_TYPE_SNOC)
+			break;
+
+		hdd_soc_recovery_cleanup();
+		qdf_atomic_set(&is_recovery_cleanup_done, 1);
+
+		break;
+	case PLD_FW_CRASHED:
+		hdd_info("Received firmware crashed indication");
+
+		/*
+		 * doha #83, see PLD_FW_DOWN. Runs on icnss's event worker,
+		 * which also calls the driver shutdown, so this can't race
+		 * with __hdd_soc_recovery_shutdown(). Once per recovery: the
+		 * shutdown clears the flag again.
+		 */
+		if (bus_type != PLD_BUS_TYPE_SNOC ||
+		    qdf_atomic_read(&is_recovery_cleanup_done))
+			break;
+
 		hdd_soc_recovery_cleanup();
 		qdf_atomic_set(&is_recovery_cleanup_done, 1);
 
